@@ -23,7 +23,7 @@ class TestFuzzyMatching:
 
     def test_similar_match(self):
         """Very similar keys should match."""
-        match = find_fuzzy_match("DB_PASS", ["DATABASE_PASSWORD", "API_KEY"])
+        match = find_fuzzy_match("DB_PASSWORD", ["DATABASE_PASSWORD", "API_KEY"])
         assert match == "DATABASE_PASSWORD"
 
     def test_case_insensitive(self):
@@ -157,16 +157,16 @@ class TestSyncerFuzzyRename:
     def test_detects_rename(self):
         """Similar keys should be detected as renames."""
         env_content = "DATABASE_PASSWORD=secret\n"
-        example_content = "DB_PASS=<placeholder>\n"
+        example_content = "DB_PASSWORD=<placeholder>\n"
 
         syncer = Syncer(env_content, example_content)
         result = syncer.sync()
 
-        # Should rename DB_PASS to DATABASE_PASSWORD
+        # Should rename DB_PASSWORD to DATABASE_PASSWORD
         assert "DATABASE_PASSWORD" in result
         # Old key should not be in main section
         lines_before_graveyard = result.split(GRAVEYARD_MARKER)[0] if GRAVEYARD_MARKER in result else result
-        assert "DB_PASS=" not in lines_before_graveyard
+        assert "DB_PASSWORD=" not in lines_before_graveyard
 
 
 class TestSyncerStickyValues:
@@ -213,11 +213,13 @@ class TestSyncerGraveyard:
     def test_appends_to_existing_graveyard(self):
         """Should append to existing graveyard."""
         env_content = "KEY1=value\n"
+        # Use a recent date that won't expire (within 14-day TTL)
+        recent_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
         example_content = f"""KEY1=<placeholder>
 KEY2=<placeholder>
 
 {GRAVEYARD_MARKER}
-# OLD_KEY - Removed on: 2024-01-01
+# OLD_KEY - Removed on: {recent_date}
 """
 
         syncer = Syncer(env_content, example_content)

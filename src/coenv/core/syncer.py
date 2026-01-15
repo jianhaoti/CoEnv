@@ -125,6 +125,7 @@ class Syncer:
 
         # Step 2: Update existing keys and detect renames
         updated_keys = set()
+        renamed_from_keys = set()  # Track original keys that were renamed
         new_tokens = []
 
         for token in self.example_tokens:
@@ -166,6 +167,7 @@ class Syncer:
                         )
                         new_tokens.append(renamed)
                         updated_keys.add(fuzzy_match)
+                        renamed_from_keys.add(token.key)  # Track original key
                     else:
                         # Key truly removed - move to graveyard
                         new_tokens.append(token)
@@ -196,8 +198,8 @@ class Syncer:
                 else:
                     new_tokens.append(new_token)
 
-        # Step 4: Move removed keys to graveyard
-        removed_keys = set(self.example_keys.keys()) - set(self.env_keys.keys()) - updated_keys
+        # Step 4: Move removed keys to graveyard (excluding renamed keys)
+        removed_keys = set(self.example_keys.keys()) - set(self.env_keys.keys()) - updated_keys - renamed_from_keys
 
         if removed_keys:
             new_tokens = self._add_to_graveyard(new_tokens, removed_keys)
