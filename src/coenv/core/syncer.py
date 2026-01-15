@@ -2,7 +2,7 @@
 Synchronization logic for .env -> .env.example with fuzzy matching and graveyard.
 
 Key features:
-- Fuzzy rename detection (difflib.SequenceMatcher > 0.8)
+- Fuzzy rename detection (difflib.SequenceMatcher > 0.6)
 - Sticky values (never overwrite manual edits in .env.example)
 - The Graveyard (deprecated keys with 14-day TTL)
 """
@@ -16,7 +16,7 @@ from .inference import generate_placeholder
 
 GRAVEYARD_MARKER = "# === DEPRECATED ==="
 GRAVEYARD_TTL_DAYS = 14
-FUZZY_MATCH_THRESHOLD = 0.8
+FUZZY_MATCH_THRESHOLD = 0.6
 
 
 def find_fuzzy_match(key: str, candidates: List[str], threshold: float = FUZZY_MATCH_THRESHOLD) -> Optional[str]:
@@ -135,7 +135,9 @@ class Syncer:
                     # Key exists - update placeholder if not manually edited
                     new_value = generate_placeholder(token.key, self.env_keys[token.key])
 
-                    if preserve_manual_edits and not token.value.startswith('<your_'):
+                    # Check if value is a placeholder (starts with < and ends with >)
+                    is_placeholder = token.value.startswith('<') and token.value.endswith('>')
+                    if preserve_manual_edits and not is_placeholder:
                         # Sticky value - keep manual edit
                         new_tokens.append(token)
                     else:
