@@ -1,21 +1,25 @@
 """
-Synchronization logic for .env -> .env.example with fuzzy matching and graveyard.
+Synchronization logic for .env -> .env.example with fuzzy matching and tombstones.
 
 Key features:
 - Fuzzy rename detection (difflib.SequenceMatcher > 0.6)
 - Sticky values (never overwrite manual edits in .env.example)
-- The Graveyard (deprecated keys with 14-day TTL)
+- Tombstones (explicitly deprecated keys that block resurrection)
+- Multi-file aggregation with priority-based merging
 """
 
 import difflib
-from datetime import datetime, timedelta
-from typing import List, Dict, Set, Tuple, Optional
+from datetime import datetime
+from typing import List, Dict, Set, Tuple, Optional, TYPE_CHECKING
 from .lexer import Token, TokenType, parse, write, get_keys, update_value
 from .inference import generate_placeholder
 
+if TYPE_CHECKING:
+    from .discovery import AggregatedKey
 
-GRAVEYARD_MARKER = "# === DEPRECATED ==="
-GRAVEYARD_TTL_DAYS = 14
+
+DEPRECATED_MARKER = "# === DEPRECATED ==="
+TOMBSTONE_PREFIX = "[TOMBSTONE]"
 FUZZY_MATCH_THRESHOLD = 0.6
 
 
@@ -46,17 +50,17 @@ def find_fuzzy_match(key: str, candidates: List[str], threshold: float = FUZZY_M
     return best_match
 
 
-def parse_graveyard_entry(comment_line: str) -> Optional[Tuple[str, datetime]]:
+def parse_tombstone(comment_line: str) -> Optional[Tuple[str, datetime]]:
     """
-    Parse a graveyard comment to extract key and removal date.
+    Parse a tombstone comment to extract key and deprecation date.
 
-    Expected format: "# KEY_NAME - Removed on: YYYY-MM-DD"
+    Expected format: "# [TOMBSTONE] KEY_NAME - Deprecated on: YYYY-MM-DD"
 
     Args:
-        comment_line: Comment line from graveyard section
+        comment_line: Comment line from deprecated section
 
     Returns:
-        Tuple of (key, removal_date) or None if not a graveyard entry
+        Tuple of (key, deprecation_date) or None if not a tombstone
     """
     if not comment_line.strip().startswith('#'):
         return None
@@ -64,41 +68,180 @@ def parse_graveyard_entry(comment_line: str) -> Optional[Tuple[str, datetime]]:
     # Remove leading '#' and whitespace
     content = comment_line.strip()[1:].strip()
 
-    if '- Removed on:' not in content:
+    if not content.startswith(TOMBSTONE_PREFIX):
+        return None
+
+    # Remove tombstone prefix
+    content = content[len(TOMBSTONE_PREFIX):].strip()
+
+    if '- Deprecated on:' not in content:
         return None
 
     try:
-        parts = content.split('- Removed on:')
+        parts = content.split('- Deprecated on:')
         key = parts[0].strip()
         date_str = parts[1].strip()
-        removal_date = datetime.strptime(date_str, '%Y-%m-%d')
-        return (key, removal_date)
+        deprecation_date = datetime.strptime(date_str, '%Y-%m-%d')
+        return (key, deprecation_date)
     except (ValueError, IndexError):
         return None
 
 
-def is_graveyard_expired(removal_date: datetime) -> bool:
+def get_tombstoned_keys(tokens: List[Token]) -> Set[str]:
     """
-    Check if a graveyard entry has expired.
+    Extract all tombstoned keys from tokens.
 
     Args:
-        removal_date: Date when key was removed
+        tokens: List of Token objects
 
     Returns:
-        True if entry is older than GRAVEYARD_TTL_DAYS
+        Set of key names that are tombstoned
     """
-    expiry_date = removal_date + timedelta(days=GRAVEYARD_TTL_DAYS)
-    return datetime.now() > expiry_date
+    tombstoned = set()
+    in_deprecated = False
+
+    for token in tokens:
+        if token.type == TokenType.COMMENT and DEPRECATED_MARKER in token.raw:
+            in_deprecated = True
+            continue
+
+        if in_deprecated and token.type == TokenType.COMMENT:
+            entry = parse_tombstone(token.raw)
+            if entry:
+                key, _ = entry
+                tombstoned.add(key)
+
+    return tombstoned
+
+
+def find_fuzzy_tombstone_matches(
+    new_keys: Set[str],
+    tombstoned_keys: Set[str],
+    threshold: float = FUZZY_MATCH_THRESHOLD
+) -> Dict[str, str]:
+    """
+    Find new keys that fuzzy-match tombstoned keys.
+
+    This helps detect when a user adds a renamed version of a deprecated key.
+
+    Args:
+        new_keys: Set of new keys being added
+        tombstoned_keys: Set of tombstoned key names
+        threshold: Minimum similarity ratio
+
+    Returns:
+        Dict mapping new_key -> matched_tombstone_key
+    """
+    matches = {}
+
+    for new_key in new_keys:
+        match = find_fuzzy_match(new_key, list(tombstoned_keys), threshold)
+        if match:
+            matches[new_key] = match
+
+    return matches
+
+
+def add_tombstone(content: str, key: str) -> str:
+    """
+    Add a tombstone for a key to .env.example content.
+
+    Creates the deprecated section if it doesn't exist.
+    Also removes the key from the active section if present.
+
+    Args:
+        content: Current .env.example content
+        key: Key to tombstone
+
+    Returns:
+        Updated content with tombstone added
+    """
+    tokens = parse(content)
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    # Remove the key from active section if it exists
+    new_tokens = []
+    for token in tokens:
+        if token.type == TokenType.KEY_VALUE and token.key == key:
+            continue  # Skip this key - it's being tombstoned
+        new_tokens.append(token)
+
+    # Check if deprecated section exists
+    deprecated_index = None
+    for i, token in enumerate(new_tokens):
+        if token.type == TokenType.COMMENT and DEPRECATED_MARKER in token.raw:
+            deprecated_index = i
+            break
+
+    tombstone_comment = f"# {TOMBSTONE_PREFIX} {key} - Deprecated on: {today}\n"
+
+    if deprecated_index is None:
+        # Create deprecated section at end
+        if new_tokens and new_tokens[-1].type != TokenType.BLANK_LINE:
+            new_tokens.append(Token(TokenType.BLANK_LINE, raw='\n'))
+
+        new_tokens.append(Token(TokenType.COMMENT, raw=f"{DEPRECATED_MARKER}\n"))
+        new_tokens.append(Token(TokenType.COMMENT, raw=tombstone_comment))
+    else:
+        # Add after the deprecated marker
+        new_tokens.insert(deprecated_index + 1, Token(TokenType.COMMENT, raw=tombstone_comment))
+
+    return write(new_tokens)
+
+
+def remove_tombstone(content: str, key: str) -> str:
+    """
+    Remove a tombstone for a key from .env.example content.
+
+    Also cleans up the deprecated section marker if no tombstones remain.
+
+    Args:
+        content: Current .env.example content
+        key: Key to un-tombstone
+
+    Returns:
+        Updated content with tombstone removed
+    """
+    tokens = parse(content)
+
+    new_tokens = []
+    for token in tokens:
+        if token.type == TokenType.COMMENT:
+            entry = parse_tombstone(token.raw)
+            if entry and entry[0] == key:
+                continue  # Skip this tombstone
+        new_tokens.append(token)
+
+    # Check if any tombstones remain
+    remaining_tombstones = get_tombstoned_keys(new_tokens)
+
+    if not remaining_tombstones:
+        # Remove the deprecated marker and any trailing blank lines before it
+        final_tokens = []
+        for token in new_tokens:
+            if token.type == TokenType.COMMENT and DEPRECATED_MARKER in token.raw:
+                # Remove trailing blank line before marker if present
+                if final_tokens and final_tokens[-1].type == TokenType.BLANK_LINE:
+                    final_tokens.pop()
+                continue  # Skip the marker
+            final_tokens.append(token)
+        new_tokens = final_tokens
+
+    return write(new_tokens)
 
 
 class Syncer:
     """
     Manages synchronization from .env to .env.example.
+
+    Supports two modes:
+    - Single file: Traditional .env -> .env.example sync
+    - Aggregated: Multiple .env* files merged with priority -> .env.example
     """
 
     def __init__(self, env_content: str, example_content: str):
         """
-        Initialize syncer with file contents.
+        Initialize syncer with file contents (single-file mode).
 
         Args:
             env_content: Content of .env file
@@ -110,9 +253,60 @@ class Syncer:
         self.env_keys = get_keys(self.env_tokens)
         self.example_keys = get_keys(self.example_tokens)
 
+        # For aggregated mode
+        self._aggregated_keys: Optional[Dict[str, "AggregatedKey"]] = None
+
+    @classmethod
+    def from_aggregated(
+        cls,
+        aggregated_keys: Dict[str, "AggregatedKey"],
+        example_content: str
+    ) -> "Syncer":
+        """
+        Create syncer from aggregated keys (multi-file mode).
+
+        Args:
+            aggregated_keys: Dict of key -> AggregatedKey from discovery module
+            example_content: Content of .env.example file
+
+        Returns:
+            Syncer instance configured for aggregated mode
+        """
+        # Create instance with empty env content
+        instance = cls.__new__(cls)
+        instance.env_tokens = []
+        instance.example_tokens = parse(example_content)
+
+        # Convert aggregated keys to simple dict for env_keys
+        instance.env_keys = {key: agg.value for key, agg in aggregated_keys.items()}
+        instance.example_keys = get_keys(instance.example_tokens)
+
+        # Store aggregated keys for source tracking
+        instance._aggregated_keys = aggregated_keys
+
+        return instance
+
+    def get_key_source(self, key: str) -> str:
+        """
+        Get the source file for a key.
+
+        Args:
+            key: Environment variable key
+
+        Returns:
+            Source filename (e.g., ".env.local") or ".env" if not in aggregated mode
+        """
+        if self._aggregated_keys and key in self._aggregated_keys:
+            return self._aggregated_keys[key].source
+        return ".env"
+
     def sync(self, preserve_manual_edits: bool = True) -> str:
         """
-        Sync .env to .env.example with fuzzy matching and graveyard logic.
+        Sync .env to .env.example with fuzzy matching and tombstone support.
+
+        Keys are added/updated from env files. Keys removed from env files
+        are simply removed from .env.example (no auto-graveyard).
+        Tombstoned keys are skipped and not added even if present in env files.
 
         Args:
             preserve_manual_edits: If True, don't overwrite values in .env.example
@@ -120,12 +314,11 @@ class Syncer:
         Returns:
             Updated .env.example content
         """
-        # Step 1: Clean up expired graveyard entries
-        self.example_tokens = self._cleanup_graveyard()
+        # Get tombstoned keys (these will be skipped)
+        tombstoned_keys = get_tombstoned_keys(self.example_tokens)
 
-        # Step 2: Update existing keys and detect renames
+        # Step 1: Update existing keys and detect renames
         updated_keys = set()
-        renamed_from_keys = set()  # Track original keys that were renamed
         new_tokens = []
 
         for token in self.example_tokens:
@@ -153,7 +346,7 @@ class Syncer:
 
                     updated_keys.add(token.key)
                 else:
-                    # Key doesn't exist - check for fuzzy rename
+                    # Key doesn't exist in env files - check for fuzzy rename
                     remaining_env_keys = [k for k in self.env_keys.keys() if k not in updated_keys]
                     fuzzy_match = find_fuzzy_match(token.key, remaining_env_keys)
 
@@ -169,20 +362,17 @@ class Syncer:
                         )
                         new_tokens.append(renamed)
                         updated_keys.add(fuzzy_match)
-                        renamed_from_keys.add(token.key)  # Track original key
-                    else:
-                        # Key truly removed - move to graveyard
-                        new_tokens.append(token)
+                    # else: Key removed - simply don't add it (no auto-graveyard)
             else:
-                # Non-key-value token - keep as-is
+                # Non-key-value token - keep as-is (includes comments, blanks, tombstones)
                 new_tokens.append(token)
 
-        # Step 3: Add new keys from .env
-        new_keys = set(self.env_keys.keys()) - updated_keys
+        # Step 2: Add new keys from .env (excluding tombstoned keys)
+        new_keys = set(self.env_keys.keys()) - updated_keys - tombstoned_keys
 
         if new_keys:
-            # Add before graveyard if it exists, otherwise at end
-            graveyard_index = self._find_graveyard_index(new_tokens)
+            # Add before deprecated section if it exists, otherwise at end
+            deprecated_index = self._find_deprecated_index(new_tokens)
 
             for key in sorted(new_keys):
                 value = generate_placeholder(key, self.env_keys[key])
@@ -194,78 +384,18 @@ class Syncer:
                     has_export=False
                 )
 
-                if graveyard_index is not None:
-                    new_tokens.insert(graveyard_index, new_token)
-                    graveyard_index += 1
+                if deprecated_index is not None:
+                    new_tokens.insert(deprecated_index, new_token)
+                    deprecated_index += 1
                 else:
                     new_tokens.append(new_token)
 
-        # Step 4: Move removed keys to graveyard (excluding renamed keys)
-        removed_keys = set(self.example_keys.keys()) - set(self.env_keys.keys()) - updated_keys - renamed_from_keys
-
-        if removed_keys:
-            new_tokens = self._add_to_graveyard(new_tokens, removed_keys)
-
         return write(new_tokens)
 
-    def _cleanup_graveyard(self) -> List[Token]:
-        """Remove expired entries from graveyard."""
-        new_tokens = []
-        in_graveyard = False
-
-        for token in self.example_tokens:
-            if token.type == TokenType.COMMENT and GRAVEYARD_MARKER in token.raw:
-                in_graveyard = True
-                new_tokens.append(token)
-                continue
-
-            if in_graveyard and token.type == TokenType.COMMENT:
-                entry = parse_graveyard_entry(token.raw)
-                if entry:
-                    key, removal_date = entry
-                    if not is_graveyard_expired(removal_date):
-                        # Keep non-expired entry
-                        new_tokens.append(token)
-                    # Expired entries are simply not added
-                else:
-                    # Regular comment in graveyard
-                    new_tokens.append(token)
-            else:
-                new_tokens.append(token)
-
-        return new_tokens
-
-    def _add_to_graveyard(self, tokens: List[Token], removed_keys: Set[str]) -> List[Token]:
-        """Add removed keys to graveyard section."""
-        if not removed_keys:
-            return tokens
-
-        # Check if graveyard exists
-        graveyard_index = self._find_graveyard_index(tokens)
-        today = datetime.now().strftime('%Y-%m-%d')
-
-        if graveyard_index is None:
-            # Create graveyard section at end
-            if tokens and tokens[-1].type != TokenType.BLANK_LINE:
-                tokens.append(Token(TokenType.BLANK_LINE, raw='\n'))
-
-            tokens.append(Token(TokenType.COMMENT, raw=f"{GRAVEYARD_MARKER}\n"))
-
-            for key in sorted(removed_keys):
-                comment = f"# {key} - Removed on: {today}\n"
-                tokens.append(Token(TokenType.COMMENT, raw=comment))
-        else:
-            # Add to existing graveyard
-            for key in sorted(removed_keys):
-                comment = f"# {key} - Removed on: {today}\n"
-                tokens.insert(graveyard_index + 1, Token(TokenType.COMMENT, raw=comment))
-
-        return tokens
-
-    def _find_graveyard_index(self, tokens: List[Token]) -> Optional[int]:
-        """Find the index of the graveyard marker."""
+    def _find_deprecated_index(self, tokens: List[Token]) -> Optional[int]:
+        """Find the index of the deprecated section marker."""
         for i, token in enumerate(tokens):
-            if token.type == TokenType.COMMENT and GRAVEYARD_MARKER in token.raw:
+            if token.type == TokenType.COMMENT and DEPRECATED_MARKER in token.raw:
                 return i
         return None
 
@@ -284,7 +414,7 @@ class Syncer:
 
 def sync_files(env_path: str, example_path: str) -> str:
     """
-    Sync .env file to .env.example.
+    Sync .env file to .env.example (single-file mode).
 
     Args:
         env_path: Path to .env file
@@ -304,3 +434,28 @@ def sync_files(env_path: str, example_path: str) -> str:
 
     syncer = Syncer(env_content, example_content)
     return syncer.sync()
+
+
+def sync_aggregated(
+    aggregated_keys: Dict[str, "AggregatedKey"],
+    example_path: str
+) -> Tuple[str, "Syncer"]:
+    """
+    Sync aggregated keys from multiple .env* files to .env.example.
+
+    Args:
+        aggregated_keys: Dict of key -> AggregatedKey from discovery module
+        example_path: Path to .env.example file
+
+    Returns:
+        Tuple of (updated .env.example content, syncer instance for source tracking)
+    """
+    try:
+        with open(example_path, 'r') as f:
+            example_content = f.read()
+    except FileNotFoundError:
+        example_content = ""
+
+    syncer = Syncer.from_aggregated(aggregated_keys, example_content)
+    result = syncer.sync()
+    return result, syncer

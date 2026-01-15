@@ -25,6 +25,7 @@ class KeyMetadata:
     last_modified: str
     last_modified_by: str
     sync_count: int = 0
+    source: str = ".env"  # Which file this key came from (e.g., ".env.local")
 
 
 @dataclass
@@ -128,13 +129,14 @@ class MetadataStore:
 
         return "unknown"
 
-    def track_key(self, key: str, user: Optional[str] = None):
+    def track_key(self, key: str, user: Optional[str] = None, source: str = ".env"):
         """
         Track or update a key's metadata.
 
         Args:
             key: Environment variable key
             user: User name (defaults to git user)
+            source: Source file name (e.g., ".env.local")
         """
         if user is None:
             user = self.get_git_user()
@@ -147,6 +149,7 @@ class MetadataStore:
             meta.last_modified = now
             meta.last_modified_by = user
             meta.sync_count += 1
+            meta.source = source  # Update source to current file
         else:
             # New key
             self.keys[key] = KeyMetadata(
@@ -155,7 +158,8 @@ class MetadataStore:
                 created_at=now,
                 last_modified=now,
                 last_modified_by=user,
-                sync_count=1
+                sync_count=1,
+                source=source
             )
 
         self._save_metadata()

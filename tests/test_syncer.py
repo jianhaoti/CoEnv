@@ -1,16 +1,20 @@
 """
-Tests for the syncer module (fuzzy matching and graveyard logic).
+Tests for the syncer module (fuzzy matching and tombstone logic).
 """
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime
 from coenv.core.syncer import (
     find_fuzzy_match,
-    parse_graveyard_entry,
-    is_graveyard_expired,
+    parse_tombstone,
+    get_tombstoned_keys,
+    add_tombstone,
+    remove_tombstone,
     Syncer,
-    GRAVEYARD_MARKER,
+    DEPRECATED_MARKER,
+    TOMBSTONE_PREFIX,
 )
+from coenv.core.lexer import parse
 
 
 class TestFuzzyMatching:
@@ -49,13 +53,13 @@ class TestFuzzyMatching:
         assert match is None
 
 
-class TestGraveyardParsing:
-    """Test graveyard entry parsing."""
+class TestTombstoneParsing:
+    """Test tombstone entry parsing."""
 
-    def test_parse_valid_entry(self):
-        """Valid graveyard entry should be parsed."""
-        comment = "# OLD_KEY - Removed on: 2024-01-15\n"
-        result = parse_graveyard_entry(comment)
+    def test_parse_valid_tombstone(self):
+        """Valid tombstone entry should be parsed."""
+        comment = "# [TOMBSTONE] OLD_KEY - Deprecated on: 2024-01-15\n"
+        result = parse_tombstone(comment)
 
         assert result is not None
         key, date = result
@@ -65,42 +69,126 @@ class TestGraveyardParsing:
     def test_parse_invalid_format(self):
         """Invalid format should return None."""
         comment = "# Just a regular comment\n"
-        result = parse_graveyard_entry(comment)
+        result = parse_tombstone(comment)
+        assert result is None
+
+    def test_parse_old_graveyard_format(self):
+        """Old graveyard format (without TOMBSTONE prefix) should return None."""
+        comment = "# OLD_KEY - Removed on: 2024-01-15\n"
+        result = parse_tombstone(comment)
         assert result is None
 
     def test_parse_non_comment(self):
         """Non-comment lines should return None."""
         line = "KEY=value\n"
-        result = parse_graveyard_entry(line)
+        result = parse_tombstone(line)
         assert result is None
 
     def test_parse_malformed_date(self):
         """Malformed date should return None."""
-        comment = "# KEY - Removed on: invalid-date\n"
-        result = parse_graveyard_entry(comment)
+        comment = "# [TOMBSTONE] KEY - Deprecated on: invalid-date\n"
+        result = parse_tombstone(comment)
         assert result is None
 
 
-class TestGraveyardExpiry:
-    """Test graveyard entry expiry logic."""
+class TestGetTombstonedKeys:
+    """Test extracting tombstoned keys from content."""
 
-    def test_expired_entry(self):
-        """Entry older than 14 days should be expired."""
-        old_date = datetime.now() - timedelta(days=20)
-        assert is_graveyard_expired(old_date) is True
+    def test_no_tombstones(self):
+        """Content without tombstones should return empty set."""
+        content = "KEY1=value1\nKEY2=value2\n"
+        tokens = parse(content)
+        result = get_tombstoned_keys(tokens)
+        assert result == set()
 
-    def test_not_expired_entry(self):
-        """Entry within 14 days should not be expired."""
-        recent_date = datetime.now() - timedelta(days=5)
-        assert is_graveyard_expired(recent_date) is False
+    def test_single_tombstone(self):
+        """Should extract single tombstone."""
+        content = f"""KEY1=value1
 
-    def test_boundary_case(self):
-        """Entry at exactly 14 days should be tested."""
-        boundary_date = datetime.now() - timedelta(days=14)
-        # This might be expired or not depending on exact timing
-        # Just ensure it doesn't error
-        result = is_graveyard_expired(boundary_date)
-        assert isinstance(result, bool)
+{DEPRECATED_MARKER}
+# {TOMBSTONE_PREFIX} OLD_KEY - Deprecated on: 2024-01-15
+"""
+        tokens = parse(content)
+        result = get_tombstoned_keys(tokens)
+        assert result == {"OLD_KEY"}
+
+    def test_multiple_tombstones(self):
+        """Should extract multiple tombstones."""
+        content = f"""KEY1=value1
+
+{DEPRECATED_MARKER}
+# {TOMBSTONE_PREFIX} OLD_KEY1 - Deprecated on: 2024-01-15
+# {TOMBSTONE_PREFIX} OLD_KEY2 - Deprecated on: 2024-01-16
+"""
+        tokens = parse(content)
+        result = get_tombstoned_keys(tokens)
+        assert result == {"OLD_KEY1", "OLD_KEY2"}
+
+
+class TestAddTombstone:
+    """Test adding tombstones."""
+
+    def test_add_tombstone_creates_section(self):
+        """Should create deprecated section if it doesn't exist."""
+        content = "KEY1=value1\n"
+        result = add_tombstone(content, "OLD_KEY")
+
+        assert DEPRECATED_MARKER in result
+        assert TOMBSTONE_PREFIX in result
+        assert "OLD_KEY" in result
+        assert "Deprecated on:" in result
+
+    def test_add_tombstone_removes_active_key(self):
+        """Should remove key from active section when tombstoning."""
+        content = "KEY1=value1\nOLD_KEY=value2\n"
+        result = add_tombstone(content, "OLD_KEY")
+
+        # OLD_KEY should not be in active section
+        assert "OLD_KEY=value2" not in result
+        assert "OLD_KEY=" not in result
+        # But should be in tombstone
+        assert f"{TOMBSTONE_PREFIX} OLD_KEY" in result
+
+    def test_add_tombstone_appends_to_existing_section(self):
+        """Should append to existing deprecated section."""
+        content = f"""KEY1=value1
+
+{DEPRECATED_MARKER}
+# {TOMBSTONE_PREFIX} EXISTING_KEY - Deprecated on: 2024-01-15
+"""
+        result = add_tombstone(content, "NEW_OLD_KEY")
+
+        assert result.count(DEPRECATED_MARKER) == 1
+        assert "EXISTING_KEY" in result
+        assert "NEW_OLD_KEY" in result
+
+
+class TestRemoveTombstone:
+    """Test removing tombstones."""
+
+    def test_remove_tombstone(self):
+        """Should remove tombstone entry."""
+        content = f"""KEY1=value1
+
+{DEPRECATED_MARKER}
+# {TOMBSTONE_PREFIX} OLD_KEY - Deprecated on: 2024-01-15
+"""
+        result = remove_tombstone(content, "OLD_KEY")
+
+        assert "OLD_KEY" not in result
+
+    def test_remove_tombstone_preserves_others(self):
+        """Should preserve other tombstones."""
+        content = f"""KEY1=value1
+
+{DEPRECATED_MARKER}
+# {TOMBSTONE_PREFIX} KEY_TO_REMOVE - Deprecated on: 2024-01-15
+# {TOMBSTONE_PREFIX} KEY_TO_KEEP - Deprecated on: 2024-01-16
+"""
+        result = remove_tombstone(content, "KEY_TO_REMOVE")
+
+        assert "KEY_TO_REMOVE" not in result
+        assert "KEY_TO_KEEP" in result
 
 
 class TestSyncerBasic:
@@ -138,17 +226,18 @@ class TestSyncerBasic:
 
         assert "# Important comment" in result
 
-    def test_sync_removes_to_graveyard(self):
-        """Removed keys should go to graveyard."""
+    def test_sync_removes_key_silently(self):
+        """Removed keys should just disappear (no auto-graveyard)."""
         env_content = "NEW_KEY=value\n"
         example_content = "OLD_KEY=<placeholder>\nNEW_KEY=<placeholder>\n"
 
         syncer = Syncer(env_content, example_content)
         result = syncer.sync()
 
-        assert GRAVEYARD_MARKER in result
-        assert "OLD_KEY" in result
-        assert "Removed on:" in result
+        # OLD_KEY should simply be gone
+        assert "OLD_KEY" not in result
+        # NEW_KEY should remain
+        assert "NEW_KEY" in result
 
 
 class TestSyncerFuzzyRename:
@@ -164,9 +253,8 @@ class TestSyncerFuzzyRename:
 
         # Should rename DB_PASSWORD to DATABASE_PASSWORD
         assert "DATABASE_PASSWORD" in result
-        # Old key should not be in main section
-        lines_before_graveyard = result.split(GRAVEYARD_MARKER)[0] if GRAVEYARD_MARKER in result else result
-        assert "DB_PASSWORD=" not in lines_before_graveyard
+        # Old key name should not appear
+        assert "DB_PASSWORD=" not in result
 
 
 class TestSyncerStickyValues:
@@ -195,62 +283,95 @@ class TestSyncerStickyValues:
         assert "<your_api_key>" in result
 
 
-class TestSyncerGraveyard:
-    """Test graveyard functionality."""
+class TestSyncerTombstones:
+    """Test tombstone functionality during sync."""
 
-    def test_creates_graveyard(self):
-        """Should create graveyard section when keys are removed."""
-        env_content = "KEY1=value\n"
-        example_content = "KEY1=<placeholder>\nKEY2=<placeholder>\n"
+    def test_tombstone_blocks_resurrection(self):
+        """Tombstoned keys should not be added even if in env files."""
+        env_content = "API_KEY=secret\nOTHER_KEY=value\n"
+        example_content = f"""OTHER_KEY=<placeholder>
 
-        syncer = Syncer(env_content, example_content)
-        result = syncer.sync()
-
-        assert GRAVEYARD_MARKER in result
-        assert "KEY2" in result
-        assert "Removed on:" in result
-
-    def test_appends_to_existing_graveyard(self):
-        """Should append to existing graveyard."""
-        env_content = "KEY1=value\n"
-        # Use a recent date that won't expire (within 14-day TTL)
-        recent_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
-        example_content = f"""KEY1=<placeholder>
-KEY2=<placeholder>
-
-{GRAVEYARD_MARKER}
-# OLD_KEY - Removed on: {recent_date}
+{DEPRECATED_MARKER}
+# {TOMBSTONE_PREFIX} API_KEY - Deprecated on: 2024-01-15
 """
 
         syncer = Syncer(env_content, example_content)
         result = syncer.sync()
 
-        assert result.count(GRAVEYARD_MARKER) == 1  # Only one graveyard marker
-        assert "KEY2" in result
-        assert "OLD_KEY" in result
+        # API_KEY should NOT be added as active key (it's tombstoned)
+        assert "API_KEY=" not in result
+        # Tombstone should remain
+        assert f"{TOMBSTONE_PREFIX} API_KEY" in result
+        # OTHER_KEY should be there
+        assert "OTHER_KEY=" in result
 
-    def test_cleans_expired_entries(self):
-        """Should remove expired graveyard entries."""
-        env_content = "KEY1=value\n"
-
-        # Create an expired entry
-        old_date = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
-        recent_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
-
-        example_content = f"""KEY1=<placeholder>
-
-{GRAVEYARD_MARKER}
-# OLD_EXPIRED_KEY - Removed on: {old_date}
-# RECENT_KEY - Removed on: {recent_date}
+    def test_non_tombstoned_key_resurrected(self):
+        """Keys not tombstoned should be resurrected normally."""
+        env_content = "API_KEY=secret\n"
+        # Old-style graveyard entry (not a tombstone) - should be resurrected
+        example_content = f"""
+{DEPRECATED_MARKER}
+# API_KEY - Removed on: 2024-01-15
 """
 
         syncer = Syncer(env_content, example_content)
         result = syncer.sync()
 
-        # Expired entry should be removed
-        assert "OLD_EXPIRED_KEY" not in result
-        # Recent entry should remain
-        assert "RECENT_KEY" in result
+        # API_KEY should be added (old graveyard format doesn't block)
+        assert "API_KEY=" in result
+
+    def test_tombstone_preserved_during_sync(self):
+        """Tombstones should be preserved during sync."""
+        env_content = "ACTIVE_KEY=value\n"
+        example_content = f"""ACTIVE_KEY=<placeholder>
+
+{DEPRECATED_MARKER}
+# {TOMBSTONE_PREFIX} DEAD_KEY - Deprecated on: 2024-01-15
+"""
+
+        syncer = Syncer(env_content, example_content)
+        result = syncer.sync()
+
+        assert f"{TOMBSTONE_PREFIX} DEAD_KEY" in result
+
+
+class TestSyncerCollaboration:
+    """Test collaborative scenarios (Alice/Bob)."""
+
+    def test_accidental_deletion_resurrected(self):
+        """Accidentally deleted key should be resurrected by teammate."""
+        # Alice deleted API_KEY, it just disappears from .env.example
+        # Bob still has API_KEY, pulls, runs sync - it comes back
+        bob_env = "API_KEY=bobs_key\nOTHER_KEY=value\n"
+        alice_example = "OTHER_KEY=<placeholder>\n"  # API_KEY is gone
+
+        syncer = Syncer(bob_env, alice_example)
+        result = syncer.sync()
+
+        # API_KEY should be added back
+        assert "API_KEY=" in result
+        assert "OTHER_KEY=" in result
+
+    def test_intentional_deprecation_blocks(self):
+        """Intentionally deprecated key should stay deprecated."""
+        # Alice deprecated API_KEY with tombstone
+        # Bob still has API_KEY, pulls, runs sync - it should NOT come back
+        bob_env = "API_KEY=bobs_key\nOTHER_KEY=value\n"
+        alice_example = f"""OTHER_KEY=<placeholder>
+
+{DEPRECATED_MARKER}
+# {TOMBSTONE_PREFIX} API_KEY - Deprecated on: 2024-01-15
+"""
+
+        syncer = Syncer(bob_env, alice_example)
+        result = syncer.sync()
+
+        # API_KEY should NOT be resurrected
+        assert "API_KEY=" not in result
+        # Tombstone should remain
+        assert f"{TOMBSTONE_PREFIX} API_KEY" in result
+        # OTHER_KEY should be there
+        assert "OTHER_KEY=" in result
 
 
 if __name__ == "__main__":

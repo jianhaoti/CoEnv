@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .core.lexer import parse, get_keys
-from .core.syncer import sync_files
+from .core.syncer import sync_files, sync_aggregated
+from .core.discovery import discover_env_files, aggregate_env_files, get_example_path
 from .core.metadata import MetadataStore
-from .main import find_env_files
 
 
 def get_status_tool(project_root: str = ".") -> Dict[str, Any]:
@@ -25,34 +25,35 @@ def get_status_tool(project_root: str = ".") -> Dict[str, Any]:
     Get environment variable status.
 
     Returns:
-        Dictionary with status information
+        Dictionary with status information including discovered files and sources
     """
     metadata = MetadataStore(project_root)
-    env_path, example_path = find_env_files(project_root)
 
-    if not Path(env_path).exists():
+    # Discover and aggregate all .env* files
+    env_files = discover_env_files(project_root)
+    example_path = get_example_path(project_root)
+
+    if not env_files:
         return {
             'success': False,
-            'error': '.env file not found'
+            'error': 'No .env files found'
         }
 
-    # Parse .env
-    with open(env_path, 'r') as f:
-        env_content = f.read()
-
-    env_keys = get_keys(parse(env_content))
+    aggregated_keys = aggregate_env_files(env_files, project_root)
+    discovered_files = [f.name for f in env_files]
 
     # Parse .env.example if it exists
     example_keys = {}
-    if Path(example_path).exists():
+    if example_path.exists():
         with open(example_path, 'r') as f:
             example_content = f.read()
         example_keys = get_keys(parse(example_content))
 
     # Build status for each key
     keys_status = []
-    for key in sorted(env_keys.keys()):
-        value = env_keys[key]
+    for key in sorted(aggregated_keys.keys()):
+        agg_key = aggregated_keys[key]
+        value = agg_key.value
 
         # Determine repo status
         repo_status = "synced" if key in example_keys else "missing"
@@ -66,6 +67,8 @@ def get_status_tool(project_root: str = ".") -> Dict[str, Any]:
 
         keys_status.append({
             'key': key,
+            'source': agg_key.source,
+            'all_sources': agg_key.all_sources,
             'repo_status': repo_status,
             'health': health,
             'owner': owner,
@@ -73,52 +76,55 @@ def get_status_tool(project_root: str = ".") -> Dict[str, Any]:
 
     return {
         'success': True,
-        'total_keys': len(env_keys),
-        'synced_keys': sum(1 for k in env_keys if k in example_keys),
-        'missing_keys': sum(1 for k in env_keys if k not in example_keys),
+        'discovered_files': discovered_files,
+        'total_keys': len(aggregated_keys),
+        'synced_keys': sum(1 for k in aggregated_keys if k in example_keys),
+        'missing_keys': sum(1 for k in aggregated_keys if k not in example_keys),
         'keys': keys_status,
     }
 
 
 def trigger_sync_tool(project_root: str = ".") -> Dict[str, Any]:
     """
-    Sync .env to .env.example.
+    Sync all .env* files to .env.example.
 
     Returns:
-        Dictionary with sync results
+        Dictionary with sync results including discovered files
     """
     metadata = MetadataStore(project_root)
-    env_path, example_path = find_env_files(project_root)
 
-    if not Path(env_path).exists():
+    # Discover and aggregate all .env* files
+    env_files = discover_env_files(project_root)
+    example_path = get_example_path(project_root)
+
+    if not env_files:
         return {
             'success': False,
-            'error': '.env file not found'
+            'error': 'No .env files found'
         }
 
     try:
-        # Perform sync
-        updated_content = sync_files(env_path, example_path)
+        aggregated_keys = aggregate_env_files(env_files, project_root)
+        discovered_files = [f.name for f in env_files]
+
+        # Perform aggregated sync
+        updated_content, syncer = sync_aggregated(aggregated_keys, str(example_path))
 
         # Write updated .env.example
         with open(example_path, 'w') as f:
             f.write(updated_content)
 
-        # Update metadata
-        with open(env_path, 'r') as f:
-            env_content = f.read()
+        # Update metadata with source tracking
+        for key, agg_key in aggregated_keys.items():
+            metadata.track_key(key, source=agg_key.source)
 
-        env_keys = get_keys(parse(env_content))
-
-        for key in env_keys:
-            metadata.track_key(key)
-
-        metadata.log_activity("sync", len(env_keys))
+        metadata.log_activity("sync", len(aggregated_keys))
 
         return {
             'success': True,
-            'keys_synced': len(env_keys),
-            'message': f'Synced {len(env_keys)} keys to .env.example'
+            'discovered_files': discovered_files,
+            'keys_synced': len(aggregated_keys),
+            'message': f'Synced {len(aggregated_keys)} keys from {len(discovered_files)} file(s) to .env.example'
         }
     except Exception as e:
         return {
@@ -131,6 +137,9 @@ def run_doctor_tool(project_root: str = ".", auto_add: bool = True) -> Dict[str,
     """
     Add missing keys from .env.example to .env.
 
+    Compares .env.example against all discovered .env* files and appends
+    any missing keys to the base .env file.
+
     Args:
         project_root: Project root directory
         auto_add: If True, automatically add keys with placeholder values
@@ -139,48 +148,59 @@ def run_doctor_tool(project_root: str = ".", auto_add: bool = True) -> Dict[str,
         Dictionary with doctor results
     """
     metadata = MetadataStore(project_root)
-    env_path, example_path = find_env_files(project_root)
 
-    if not Path(example_path).exists():
+    # Discover and aggregate all .env* files
+    env_files = discover_env_files(project_root)
+    example_path = get_example_path(project_root)
+
+    if not example_path.exists():
         return {
             'success': False,
             'error': '.env.example file not found'
         }
 
-    # Parse both files
-    if Path(env_path).exists():
+    # Get aggregated keys from all discovered files
+    aggregated_keys = aggregate_env_files(env_files, project_root) if env_files else {}
+    discovered_files = [f.name for f in env_files]
+
+    # Get the base .env file path for appending missing keys
+    env_path = Path(project_root) / ".env"
+
+    # Read existing .env content if it exists
+    if env_path.exists():
         with open(env_path, 'r') as f:
             env_content = f.read()
-        env_keys = get_keys(parse(env_content))
     else:
         env_content = ""
-        env_keys = {}
 
+    # Parse .env.example
     with open(example_path, 'r') as f:
         example_content = f.read()
 
     example_keys = get_keys(parse(example_content))
 
-    # Find missing keys
-    missing_keys = set(example_keys.keys()) - set(env_keys.keys())
+    # Find missing keys (in .env.example but not in any discovered .env* file)
+    missing_keys = set(example_keys.keys()) - set(aggregated_keys.keys())
 
     if not missing_keys:
         return {
             'success': True,
+            'discovered_files': discovered_files,
             'keys_added': 0,
-            'message': 'No missing keys - .env is up to date'
+            'message': 'No missing keys - environment is up to date'
         }
 
     if not auto_add:
         return {
             'success': True,
+            'discovered_files': discovered_files,
             'keys_added': 0,
             'missing_keys': list(missing_keys),
             'message': f'Found {len(missing_keys)} missing keys (not added, auto_add=False)'
         }
 
     try:
-        # Append missing keys to .env
+        # Append missing keys to base .env file
         with open(env_path, 'a') as f:
             if env_content and not env_content.endswith('\n'):
                 f.write('\n')
@@ -195,8 +215,9 @@ def run_doctor_tool(project_root: str = ".", auto_add: bool = True) -> Dict[str,
 
         return {
             'success': True,
+            'discovered_files': discovered_files,
             'keys_added': len(missing_keys),
-            'added_keys': list(missing_keys),
+            'added_keys': list(sorted(missing_keys)),
             'message': f'Added {len(missing_keys)} keys to .env'
         }
     except Exception as e:
@@ -247,7 +268,7 @@ def run_server():
         'tools': [
             {
                 'name': 'get_status',
-                'description': 'Get current environment variable status including sync state and ownership',
+                'description': 'Get environment variable status from all .env* files, including source tracking and sync state',
                 'parameters': {
                     'type': 'object',
                     'properties': {
@@ -261,7 +282,7 @@ def run_server():
             },
             {
                 'name': 'trigger_sync',
-                'description': 'Sync .env to .env.example with intelligent placeholders',
+                'description': 'Sync all .env* files to .env.example with priority merging (.env.local > .env.[mode] > .env)',
                 'parameters': {
                     'type': 'object',
                     'properties': {
@@ -275,7 +296,7 @@ def run_server():
             },
             {
                 'name': 'run_doctor',
-                'description': 'Add missing keys from .env.example to .env',
+                'description': 'Add missing keys from .env.example that are not in any .env* file',
                 'parameters': {
                     'type': 'object',
                     'properties': {
