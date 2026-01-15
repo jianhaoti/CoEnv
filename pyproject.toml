@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coenv"
+version = "0.1.0"
+description = "Lossless, collaborative .env synchronization with ownership tracking."
+readme = "README.md"
+authors = [{ name = "jianhaoti" }]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "rich>=13.0.0",      # Beautiful terminal UI and tables
+    "click>=8.0.0",     # CLI command structure
+    "watchdog>=3.0.0",  # File system events for the background watcher
+    "mcp>=0.1.0",       # Model Context Protocol for AI Agent support
+    "requests>=2.28.0", # For detached telemetry pings
+]
+
+[project.scripts]
+coenv = "coenv.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

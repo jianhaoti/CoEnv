@@ -1,0 +1,26 @@
+# CoEnv: Collaborative Environment Manager
+A lossless, ownership-aware .env synchronization tool with built-in MCP support.
+
+## Core Mental Model
+- Source: `.env` (Private)
+- Target: `.env.example` (Public/Documentation)
+- State: Managed in `.coenv/` directory.
+- Integrity: Byte-perfect round-trip parsing is mandatory.
+- Sync Direction: Strictly one-way (.env -> .env.example).
+
+## Key Logic & Constants
+- Fuzzy Renames: Use `difflib.SequenceMatcher` with a threshold of > 0.8.
+- Secret Detection: Shannon Entropy > 4.5 or sensitive prefixes (sk_, AKIA, vault:).
+- Graveyard TTL: 14 days before stale keys are pruned from .env.example.
+- Ownership: Captured via `git config user.name` on file-save events.
+
+## Tool Interface (CLI & MCP)
+- `coenv status`: Status table with Key, Repo Status, Health (Empty check), and Owner.
+- `coenv sync`: Mirror .env to .env.example.
+- `coenv doctor`: Safely append missing keys from example to local .env.
+- `coenv --init`: Setup .coenv/ and Git hooks (pre-commit, post-merge).
+- `coenv mcp`: Entry point for Model Context Protocol server.
+
+## Telemetry Policy
+- Anonymous, opt-out, detached background process.
+- Strictly no plain-text keys or values; identifiers must be hashed.

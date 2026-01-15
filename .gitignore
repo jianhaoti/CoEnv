@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# CoEnv Specific
+.env
+.env.local
+.env.test
+.coenv/          # Don't track your tool's local state
+.coenv_history
+
+# Test projects (keep .env files out)
+demo/test_project/.env
+test_real_project/.env
+
+# IDE
+.DS_Store
+.vscode/
+.idea/
