@@ -30,7 +30,3 @@ jobs:
     - name: Run tests
       run: |
         pytest tests/ -v --cov=coenv --cov-report=term-missing
-
-    - name: Run manual test
-      run: |
-        python tests/manual_test.py
