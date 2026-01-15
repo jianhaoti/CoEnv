@@ -72,8 +72,8 @@ class TestTombstoneParsing:
         result = parse_tombstone(comment)
         assert result is None
 
-    def test_parse_old_graveyard_format(self):
-        """Old graveyard format (without TOMBSTONE prefix) should return None."""
+    def test_parse_old_deprecated_format(self):
+        """Old deprecated format (without TOMBSTONE prefix) should return None."""
         comment = "# OLD_KEY - Removed on: 2024-01-15\n"
         result = parse_tombstone(comment)
         assert result is None
@@ -226,18 +226,28 @@ class TestSyncerBasic:
 
         assert "# Important comment" in result
 
-    def test_sync_removes_key_silently(self):
-        """Removed keys should just disappear (no auto-graveyard)."""
+    def test_sync_preserves_missing_key(self):
+        """Keys missing locally should remain in .env.example (union)."""
         env_content = "NEW_KEY=value\n"
         example_content = "OLD_KEY=<placeholder>\nNEW_KEY=<placeholder>\n"
 
         syncer = Syncer(env_content, example_content)
         result = syncer.sync()
 
-        # OLD_KEY should simply be gone
-        assert "OLD_KEY" not in result
-        # NEW_KEY should remain
+        # OLD_KEY should remain from existing example
+        assert "OLD_KEY" in result
+        # NEW_KEY should remain/update
         assert "NEW_KEY" in result
+
+    def test_sync_deduplicates_keys(self):
+        """Duplicate keys should collapse to a single entry."""
+        env_content = "API_KEY=secret\n"
+        example_content = "API_KEY=<one>\nAPI_KEY=<two>\n"
+
+        syncer = Syncer(env_content, example_content)
+        result = syncer.sync()
+
+        assert result.count("API_KEY=") == 1
 
 
 class TestSyncerFuzzyRename:
@@ -257,30 +267,29 @@ class TestSyncerFuzzyRename:
         assert "DB_PASSWORD=" not in result
 
 
-class TestSyncerStickyValues:
-    """Test that manual edits are preserved."""
+class TestSyncerManualEdits:
+    """Test default behavior for manual edits."""
 
-    def test_preserves_manual_edit(self):
-        """Manually edited values should not be overwritten."""
+    def test_overwrites_manual_edit_by_default(self):
+        """Manual edits should be overwritten by default."""
+        env_content = "API_KEY=sk_test_new\n"
+        example_content = "API_KEY=custom_documentation_value\n"
+
+        syncer = Syncer(env_content, example_content)
+        result = syncer.sync()
+
+        assert "custom_documentation_value" not in result
+        assert "<your_api_key>" in result
+
+    def test_preserves_manual_edit_opt_in(self):
+        """Manual edits can be preserved when explicitly requested."""
         env_content = "API_KEY=sk_test_new\n"
         example_content = "API_KEY=custom_documentation_value\n"
 
         syncer = Syncer(env_content, example_content)
         result = syncer.sync(preserve_manual_edits=True)
 
-        # Should preserve the custom value
         assert "custom_documentation_value" in result
-
-    def test_updates_placeholder(self):
-        """Placeholder values should be updated."""
-        env_content = "API_KEY=sk_test_new\n"
-        example_content = "API_KEY=<your_api_key>\n"
-
-        syncer = Syncer(env_content, example_content)
-        result = syncer.sync(preserve_manual_edits=True)
-
-        # Should update the placeholder
-        assert "<your_api_key>" in result
 
 
 class TestSyncerTombstones:
@@ -305,10 +314,25 @@ class TestSyncerTombstones:
         # OTHER_KEY should be there
         assert "OTHER_KEY=" in result
 
+    def test_tombstone_removes_active_entry(self):
+        """Active entries for tombstoned keys should be removed."""
+        env_content = "API_KEY=secret\n"
+        example_content = f"""API_KEY=<placeholder>
+
+{DEPRECATED_MARKER}
+# {TOMBSTONE_PREFIX} API_KEY - Deprecated on: 2024-01-15
+"""
+
+        syncer = Syncer(env_content, example_content)
+        result = syncer.sync()
+
+        assert "API_KEY=" not in result
+        assert f"{TOMBSTONE_PREFIX} API_KEY" in result
+
     def test_non_tombstoned_key_resurrected(self):
         """Keys not tombstoned should be resurrected normally."""
         env_content = "API_KEY=secret\n"
-        # Old-style graveyard entry (not a tombstone) - should be resurrected
+        # Old-style deprecated entry (not a tombstone) - should be resurrected
         example_content = f"""
 {DEPRECATED_MARKER}
 # API_KEY - Removed on: 2024-01-15
@@ -317,7 +341,7 @@ class TestSyncerTombstones:
         syncer = Syncer(env_content, example_content)
         result = syncer.sync()
 
-        # API_KEY should be added (old graveyard format doesn't block)
+        # API_KEY should be added (old deprecated format doesn't block)
         assert "API_KEY=" in result
 
     def test_tombstone_preserved_during_sync(self):

@@ -48,8 +48,8 @@ coenv/
 
 1. **Lossless Parsing**: The constraint `write(parse(file)) == file` must always hold
 2. **Fuzzy Matching**: Use `difflib.SequenceMatcher` with ratio > 0.8
-3. **Sticky Values**: Never overwrite manual edits in .env.example
-4. **The Graveyard**: Deprecated keys live for 14 days before auto-deletion
+3. **Derived Output**: Overwrite manual edits in .env.example on commit
+4. **Tombstones**: Deprecated keys are blocked until explicitly undeprecated
 5. **No Latency**: Telemetry must run in detached background process
 
 ## Testing

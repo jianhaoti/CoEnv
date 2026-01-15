@@ -4,18 +4,18 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                         CoEnv CLI                            │
-│                        (main.py)                             │
+│                         CoEnv CLI                           │
+│                        (main.py)                            │
 └────────────────────┬────────────────────────────────────────┘
                      │
       ┌──────────────┼──────────────┐
       │              │              │
       ▼              ▼              ▼
-┌──────────┐   ┌──────────┐   ┌──────────┐
-│  status  │   │   sync   │   │  doctor  │
-└────┬─────┘   └────┬─────┘   └────┬─────┘
-     │              │              │
-     └──────────────┼──────────────┘
+┌──────────┐   ┌────────────┐
+│  status  │   │ commit-hook│
+└────┬─────┘   └─────┬──────┘
+     │              │
+     └──────────────┘
                     │
         ┌───────────┴───────────┐
         │                       │
@@ -28,17 +28,20 @@
         ├──────────┐
         │          │
         ▼          ▼
-┌───────────┐  ┌─────────────┐
-│  Lexer    │  │  Inference  │
+┌───────────┐  ┌─────────────-┐
+│  Lexer    │  │  Inference   │
 │(lexer.py) │  │(inference.py)│
-└───────────┘  └─────────────┘
+└───────────┘  └─────────────-┘
 ```
 
 ## Data Flow
 
-### Sync Operation (.env → .env.example)
+### Commit-Hook Generation (.env → .env.example)
 
 ```
+0. Read .env.example (if exists) for exclude markers
+   │
+   ▼
 1. Read .env file
    │
    ▼
@@ -63,8 +66,8 @@
    ├─ Match keys (exact + fuzzy)
    ├─ Update placeholders
    ├─ Add new keys
-   ├─ Move removed keys to graveyard
-   └─ Clean expired graveyard entries
+   ├─ Preserve existing keys (union)
+   └─ Skip tombstoned keys
    │
    ▼
 6. Write new .env.example
@@ -79,14 +82,20 @@
 9. Telemetry.track_sync() (background)
 ```
 
+**Guards**:
+- Fail if `.env.example` contains merge conflict markers
+- Fail if `.env.local` exists without an exclude marker
+
 ## Module Responsibilities
 
 ### Core Modules
 
 #### lexer.py
+
 **Purpose**: Lossless .env file parsing
 
 **Key Functions**:
+
 - `parse(content)` → List[Token]
 - `write(tokens)` → str
 - `get_keys(tokens)` → dict
@@ -95,15 +104,18 @@
 **Constraint**: `write(parse(file)) == file` (byte-identical)
 
 **Token Types**:
+
 - `COMMENT`: Lines starting with #
 - `BLANK_LINE`: Empty lines
 - `KEY_VALUE`: KEY=value pairs
 - `EXPORT_PREFIX`: export KEY=value
 
 #### inference.py
+
 **Purpose**: Secret and encryption detection
 
 **Key Functions**:
+
 - `calculate_entropy(value)` → float
 - `is_secret(value)` → bool
 - `is_encrypted(value)` → bool
@@ -111,49 +123,60 @@
 - `analyze_value(key, value)` → dict
 
 **Detection Methods**:
+
 - Entropy threshold: > 4.5
-- Secret prefixes: sk_, AKIA, vault:, ghp_, etc.
+- Secret prefixes: sk*, AKIA, vault:, ghp*, etc.
 - Encryption prefixes: encrypted:, sops:, ENC[
 
 #### syncer.py
+
 **Purpose**: Sync .env to .env.example
 
 **Key Functions**:
+
 - `find_fuzzy_match(key, candidates)` → Optional[str]
 - `Syncer.sync()` → str
-- `parse_graveyard_entry(comment)` → Tuple[str, datetime]
-- `is_graveyard_expired(date)` → bool
+- `parse_tombstone(comment)` → Tuple[str, datetime]
 
 **Features**:
+
 - Fuzzy matching: difflib.SequenceMatcher > 0.8
-- Sticky values: Preserve manual edits
-- Graveyard: 14-day TTL for removed keys
+- Derived output: Overwrite manual edits on commit
+- Union behavior: Preserve existing keys unless deprecated
+- Idempotent output: Duplicate keys collapse to a single entry
+- Tombstones: Explicit deprecations block resurrection
 
 #### metadata.py
+
 **Purpose**: Ownership tracking and reporting
 
 **Key Classes**:
+
 - `KeyMetadata`: Per-key metadata
-- `ActivityLog`: Sync/save/doctor events
+- `ActivityLog`: Sync/save events
 - `MetadataStore`: Central metadata manager
 
 **Features**:
+
 - Git-based ownership (git config user.name)
 - Activity logging
 - Weekly "Friday Pulse" summaries
 - JSON persistence in .coenv/
+- Per-key owner via git blame on local `.env.example`
 
 #### telemetry.py
+
 **Purpose**: Anonymous usage tracking
 
 **Key Functions**:
+
 - `send_telemetry_background()` → void
 - `track_sync()`
 - `track_status()`
-- `track_doctor()`
 - `opt_out()`
 
 **Implementation**:
+
 - Detached subprocess
 - No main thread latency
 - SHA256 hashing for privacy
@@ -162,27 +185,31 @@
 ### Application Layer
 
 #### main.py
+
 **Purpose**: CLI interface
 
 **Commands**:
+
 - `coenv status`: Show status table
-- `coenv sync`: Sync .env to .env.example
-- `coenv doctor`: Add missing keys
+- `coenv commit-hook`: Internal pre-commit hook to generate `.env.example`
+- `coenv merge-hook`: Internal post-merge/rewrite hook to report changes and regenerate
+- `coenv exclude-file`: Mark env files to exclude from aggregation
 - `coenv --init`: Initialize project
 - `coenv --watch`: File watcher (stub)
 - `coenv mcp`: Start MCP server
 
 **Dependencies**:
+
 - click: Command-line interface
 - rich: Terminal UI (tables, panels, colors)
 
 #### mcp_server.py
+
 **Purpose**: AI agent integration
 
 **MCP Tools**:
+
 - `get_status`: Environment status
-- `trigger_sync`: Perform sync
-- `run_doctor`: Add missing keys
 
 **Protocol**: JSON-RPC over stdio
 
@@ -195,16 +222,18 @@
 ```
 project/
 ├── .env                    # Source of truth (never committed)
-├── .env.example            # Generated documentation (committed)
+├── .env.example            # Generated documentation (committed, includes markers)
 ├── .coenv/
 │   ├── metadata.json       # Key ownership and metadata
 │   ├── activity.log        # Activity history
 │   ├── .last_pulse         # Last Friday Pulse timestamp
+│   ├── env_cache.json      # Optional env file scan cache
 │   └── .no-telemetry       # Telemetry opt-out marker
 └── .git/
     └── hooks/
-        ├── pre-commit      # Auto-sync on commit
-        └── post-merge      # Auto-doctor on merge
+        ├── pre-commit      # Auto-generate .env.example on commit
+        ├── post-merge      # Report changes and re-derive .env.example after merge
+        └── post-rewrite    # Report changes and re-derive after rebase/amend
 ```
 
 ### In-Memory State
@@ -230,21 +259,25 @@ Metadata Store
 ## Design Patterns
 
 ### 1. Token Stream Pattern (Lexer)
+
 - Immutable tokens preserve original structure
 - Easy to reconstruct byte-perfect output
 - Simple to transform and filter
 
 ### 2. Strategy Pattern (Inference)
+
 - Multiple detection strategies (entropy, prefix, format)
 - Composable for complex decisions
 - Easy to extend with new detection methods
 
 ### 3. Repository Pattern (Metadata)
+
 - Abstract data persistence
 - Clean separation of business logic and storage
 - Easy to swap JSON for database
 
 ### 4. Template Method (Syncer)
+
 - Sync algorithm has fixed structure
 - Extension points for custom behavior
 - Consistent workflow
@@ -286,7 +319,7 @@ Metadata Layer
 2. **Detached Telemetry**: Zero latency for user
 3. **Incremental Sync**: Only process changed keys
 4. **Fuzzy Match Caching**: Could cache similarity ratios
-5. **Graveyard Cleanup**: Only on sync, not on status
+5. **Tombstone Checks**: Only on commit-hook, not on status
 
 ### Scalability
 
@@ -295,11 +328,13 @@ Metadata Layer
 - **Large projects** (500+ keys): Still under 1 second
 
 **Bottlenecks**:
+
 - Fuzzy matching is O(n²) in worst case
 - File I/O dominates for large files
 - Git operations can be slow
 
 **Mitigation**:
+
 - Fuzzy match only for missing keys (not all keys)
 - Stream processing for very large files (future)
 - Cache git config results
@@ -323,15 +358,18 @@ Metadata Layer
 ## Testing Strategy
 
 ### Unit Tests (pytest)
+
 - test_lexer.py: Token parsing, round-trip
 - test_inference.py: Secret detection, placeholders
-- test_syncer.py: Fuzzy matching, graveyard
+- test_syncer.py: Fuzzy matching, tombstones, union behavior
 
 ### Integration Tests
+
 - manual_test.py: End-to-end validation
 - demo.py: Real-world workflow
 
 ### Test Coverage
+
 - Core modules: ~90% coverage
 - Edge cases: Handled and tested
 - Round-trip: 100% verified

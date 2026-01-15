@@ -66,7 +66,7 @@ def send_telemetry_background(event_type: str, data: Dict[str, Any], project_roo
     to send the telemetry asynchronously.
 
     Args:
-        event_type: Type of event (e.g., "sync", "status", "doctor")
+        event_type: Type of event (e.g., "sync", "status")
         data: Event data (will be anonymized)
         project_root: Project root directory
     """
@@ -157,23 +157,6 @@ def track_status(key_count: int, missing_count: int, project_root: str = "."):
         {
             'key_count': key_count,
             'missing_count': missing_count,
-        },
-        project_root
-    )
-
-
-def track_doctor(keys_added: int, project_root: str = "."):
-    """
-    Track a doctor operation.
-
-    Args:
-        keys_added: Number of keys added
-        project_root: Project root directory
-    """
-    send_telemetry_background(
-        'doctor',
-        {
-            'keys_added': keys_added,
         },
         project_root
     )

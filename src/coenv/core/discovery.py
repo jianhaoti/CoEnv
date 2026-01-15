@@ -8,8 +8,41 @@ with priority-based merging and source tracking.
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+import json
+import os
+
+ENV_CACHE_FILE = ".coenv/env_cache.json"
+DEFAULT_PRUNE_DIRS = {
+    ".git",
+    ".coenv",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "dist",
+    "build",
+}
 
 from .lexer import parse, get_keys
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _is_excluded(path: Path, root: Path, excluded: set[str]) -> bool:
+    if not excluded:
+        return False
+    if path.name in excluded:
+        return True
+    try:
+        rel_name = str(path.relative_to(root))
+    except ValueError:
+        return False
+    return rel_name in excluded
 
 
 @dataclass
@@ -46,7 +79,45 @@ def get_file_priority(filename: str) -> int:
     return 0
 
 
-def discover_env_files(project_root: str = ".") -> list[Path]:
+def _load_env_cache(project_root: str) -> list[Path] | None:
+    cache_path = Path(project_root) / ENV_CACHE_FILE
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    if data.get("root") != str(Path(project_root).resolve()):
+        return None
+
+    files = []
+    for rel_path in data.get("files", []):
+        path = Path(project_root) / rel_path
+        if path.exists():
+            files.append(path)
+    return files
+
+
+def _save_env_cache(project_root: str, files: list[Path]) -> None:
+    cache_path = Path(project_root) / ENV_CACHE_FILE
+    cache_path.parent.mkdir(exist_ok=True)
+    data = {
+        "root": str(Path(project_root).resolve()),
+        "files": [str(path.relative_to(project_root)) for path in files],
+    }
+    try:
+        cache_path.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass
+
+
+def discover_env_files(
+    project_root: str = ".",
+    exclude_files: Optional[set[str]] = None,
+    recursive: bool | None = None,
+    use_cache: bool | None = None,
+) -> list[Path]:
     """
     Discover all .env* files in project root.
 
@@ -56,33 +127,82 @@ def discover_env_files(project_root: str = ".") -> list[Path]:
 
     Args:
         project_root: Path to project root directory
+        exclude_files: Optional set of filenames or relative paths to skip
+        recursive: If True, scan subdirectories (monorepo support)
+        use_cache: If True, use cached paths when available
+
+    Environment:
+        COENV_RECURSIVE=0 disables recursive scanning
+        COENV_USE_SCAN_CACHE=1 enables cached path usage
+
+    Notes:
+        Cached scans are best-effort and may miss newly added env files until refreshed.
 
     Returns:
         List of Path objects sorted by priority (highest first)
     """
     root = Path(project_root)
     env_files = []
+    excluded = exclude_files or set()
+    if recursive is None:
+        recursive = _env_bool("COENV_RECURSIVE", True)
+    if use_cache is None:
+        use_cache = _env_bool("COENV_USE_SCAN_CACHE", False)
 
-    # Find all .env* files in root directory only (not recursive)
-    for path in root.iterdir():
-        if not path.is_file():
-            continue
+    if use_cache:
+        cached = _load_env_cache(project_root)
+        if cached is not None:
+            env_files = [path for path in cached if not _is_excluded(path, root, excluded)]
+        else:
+            use_cache = False
 
-        name = path.name
+    if not use_cache:
+        if recursive:
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in DEFAULT_PRUNE_DIRS]
 
-        # Must start with .env
-        if not name.startswith(".env"):
-            continue
+                for filename in filenames:
+                    if not filename.startswith(".env"):
+                        continue
+                    if filename == ".env.example":
+                        continue
 
-        # Exclude .env.example
-        if name == ".env.example":
-            continue
+                    path = Path(dirpath) / filename
 
-        # Exclude anything in .coenv/ (shouldn't happen at root level, but be safe)
-        if ".coenv" in path.parts:
-            continue
+                    if ".coenv" in path.parts:
+                        continue
 
-        env_files.append(path)
+                    if _is_excluded(path, root, excluded):
+                        continue
+
+                    env_files.append(path)
+        else:
+            # Find all .env* files in root directory only (not recursive)
+            for path in root.iterdir():
+                if not path.is_file():
+                    continue
+
+                name = path.name
+
+                # Must start with .env
+                if not name.startswith(".env"):
+                    continue
+
+                # Exclude .env.example
+                if name == ".env.example":
+                    continue
+
+                # Exclude anything in .coenv/ (shouldn't happen at root level, but be safe)
+                if ".coenv" in path.parts:
+                    continue
+
+                # Skip excluded files by name or relative path
+                if _is_excluded(path, root, excluded):
+                    continue
+
+                env_files.append(path)
+
+        _save_env_cache(project_root, env_files)
 
     # Sort by priority (highest first)
     env_files.sort(key=lambda p: get_file_priority(p.name), reverse=True)

@@ -19,7 +19,7 @@ coenv --init
 
 This will:
 - Create `.coenv/` directory for metadata
-- Install git hooks (pre-commit, post-merge)
+- Install git hooks (pre-commit, post-merge, post-rewrite)
 - Add `.env` to `.gitignore`
 
 ### 2. Create Your .env File
@@ -32,13 +32,13 @@ API_KEY=your_secret_api_key
 DEBUG=true
 ```
 
-### 3. Sync to .env.example
+### 3. Commit to Generate .env.example
 
 ```bash
-coenv sync
+git commit -m "chore: bootstrap env docs"
 ```
 
-This generates `.env.example` with safe placeholders:
+This generates `.env.example` via the pre-commit hook with safe placeholders:
 
 ```bash
 # .env.example
@@ -48,7 +48,7 @@ API_KEY=<your_api_key>
 DEBUG=true
 ```
 
-**Note:** Secrets are automatically detected and replaced with placeholders!
+**Note:** `.env.example` is auto-generated on commit and should be treated as read-only.
 
 ## Commands
 
@@ -58,7 +58,7 @@ Show environment variable status table with:
 - Key name
 - Repo status (synced/missing)
 - Health (set/empty)
-- Owner (who added it)
+- Owner (per-key blame from your local .env.example)
 
 ```bash
 $ coenv status
@@ -73,33 +73,39 @@ Environment Variable Status
 └─────────────────┴─────────────┴──────────┴────────────┘
 ```
 
-### `coenv sync`
+Note: `.env.example` is generated automatically on commit; update `.env*` files and commit to refresh it.
 
-Sync `.env` to `.env.example`:
-- Adds new keys with intelligent placeholders
-- Updates existing keys (unless manually edited)
-- Detects renamed keys via fuzzy matching
-- Moves removed keys to "The Graveyard"
+### `coenv exclude-file`
+
+Exclude a file from `.env.example` generation:
 
 ```bash
-$ coenv sync
-✓ Synced 15 keys to .env.example
+$ coenv exclude-file .env.local
 ```
 
-### `coenv doctor`
-
-Add missing keys from `.env.example` to `.env`:
+This writes a marker in `.env.example`:
 
 ```bash
-$ coenv doctor
-Found 3 missing keys in .env
-  + NEW_API_KEY
-  + FEATURE_FLAG
-  + REDIS_URL
-
-✓ Added 3 keys to .env
-⚠ Please update the placeholder values with actual values
+# [EXCLUDE_FILE] .env.local
 ```
+
+If `.env.local` exists and is not excluded, hooks will fail to prevent accidental leakage.
+
+### Monorepos and scan cache
+
+By default, CoEnv scans subdirectories for `.env*` files. To limit discovery to the repo root, set:
+
+```bash
+COENV_RECURSIVE=0
+```
+
+For large repos, you can enable a cached path list:
+
+```bash
+COENV_USE_SCAN_CACHE=1
+```
+
+This uses `.coenv/env_cache.json` and can miss newly added `.env*` files until the cache is refreshed (delete the file or run once without the cache).
 
 ### `coenv --init`
 
@@ -139,29 +145,22 @@ DATABASE_PASSWORD=secret123
 DATABASE_PASSWORD=<your_database_password>  # Renamed in-place!
 ```
 
-### The Graveyard
+### Deprecation (Tombstones)
 
-Removed keys are moved to a deprecated section:
+Removed keys are only excluded when explicitly deprecated:
+
+```bash
+coenv deprecate OLD_API_KEY
+```
+
+This adds a tombstone in `.env.example` to block resurrection:
 
 ```bash
 # === DEPRECATED ===
-# OLD_API_KEY - Removed on: 2026-01-14
-# LEGACY_DB_URL - Removed on: 2026-01-10
+# [TOMBSTONE] OLD_API_KEY - Deprecated on: 2026-01-14
 ```
 
-Entries are automatically deleted after 14 days.
-
-### Sticky Values
-
-Manual edits in `.env.example` are preserved:
-
-```bash
-# .env.example (manually edited)
-API_ENDPOINT=https://api.production.com  # Custom documentation
-
-# After sync: Value is preserved!
-API_ENDPOINT=https://api.production.com  # Still there
-```
+Use `coenv undeprecate OLD_API_KEY` to allow it again.
 
 ### Ownership Tracking
 
@@ -188,7 +187,6 @@ Weekly summary of team activity:
 │ Week of 2026-01-10             │
 │                                 │
 │ Syncs: 23                      │
-│ Doctor runs: 5                 │
 │ Total keys affected: 147       │
 │ Active users: 3 (alice, bob, charlie) │
 └─────────────────────────────────┘
@@ -199,20 +197,36 @@ Weekly summary of team activity:
 CoEnv installs git hooks during `--init`:
 
 ### Pre-commit Hook
-Automatically syncs `.env` to `.env.example` before each commit:
+Automatically generates `.env.example` before each commit:
 
 ```bash
 #!/bin/sh
-coenv sync
+set -e
+command -v coenv >/dev/null 2>&1 || { echo "coenv not found in PATH"; exit 1; }
+coenv commit-hook
 git add .env.example
 ```
 
 ### Post-merge Hook
-Runs `coenv doctor` after merging to add missing keys:
+Reports `.env.example` changes (with owners) and regenerates after merging:
 
 ```bash
 #!/bin/sh
-coenv doctor
+set -e
+command -v coenv >/dev/null 2>&1 || { echo "coenv not found in PATH"; exit 1; }
+coenv merge-hook
+```
+
+This prints added/deprecated keys and their last author (from `git blame`).
+
+### Post-rewrite Hook
+Runs after rebase or amend to report changes and keep `.env.example` in sync:
+
+```bash
+#!/bin/sh
+set -e
+command -v coenv >/dev/null 2>&1 || { echo "coenv not found in PATH"; exit 1; }
+coenv merge-hook
 ```
 
 ## MCP Server for AI Agents
@@ -222,8 +236,6 @@ CoEnv includes an MCP server for Claude, Cursor, Windsurf, and other AI agents.
 ### Available Tools
 
 - `get_status`: Get environment variable status
-- `trigger_sync`: Sync .env to .env.example
-- `run_doctor`: Add missing keys from .env.example
 
 ### Configuration
 
@@ -245,7 +257,7 @@ Now AI agents can manage your environment variables!
 ## Telemetry
 
 CoEnv sends anonymous usage data to improve the tool. This includes:
-- Command usage counts (sync, status, doctor)
+- Command usage counts (pre-commit hook, status)
 - Number of keys (not the keys themselves)
 - Errors and exceptions
 
@@ -264,10 +276,12 @@ export COENV_NO_TELEMETRY=1
 ## Best Practices
 
 1. **Always commit .env.example**: This is your team's documentation
-2. **Never commit .env**: Keep secrets out of the repository
-3. **Run `coenv status` regularly**: Check for missing or outdated keys
-4. **Use `coenv doctor` after pulling**: Ensure you have all required keys
-5. **Review .env.example changes**: Make sure sensitive data isn't leaked
+2. **Treat .env.example as generated**: Update `.env*` files and commit, do not edit by hand
+3. **Never commit .env**: Keep secrets out of the repository
+4. **Run `coenv status` regularly**: Check for missing or outdated keys
+5. **Exclude local-only files**: Use `coenv exclude-file .env.local` if needed
+6. **Review `.env.example` after pulling**: Ensure you have all required keys
+7. **Review .env.example changes**: Make sure sensitive data isn't leaked
 
 ## Troubleshooting
 
@@ -289,6 +303,18 @@ Make hooks executable:
 chmod +x .git/hooks/pre-commit .git/hooks/post-merge
 ```
 
+### Merge conflict markers in .env.example
+
+If `.env.example` contains `<<<<<<<`/`=======`/`>>>>>>>`, hooks will fail. Resolve the conflict manually, then rerun your git command.
+
+### .env.local present but not excluded
+
+If you see an error about `.env.local` not being excluded, run:
+
+```bash
+coenv exclude-file .env.local
+```
+
 ### Fuzzy matching not working
 
 The threshold is 0.8 (80% similarity). Very different keys won't match. Rename manually if needed.
@@ -298,7 +324,7 @@ The threshold is 0.8 (80% similarity). Very different keys won't match. Rename m
 ### Custom Project Root
 
 ```bash
-coenv sync --project-root /path/to/project
+coenv status --project-root /path/to/project
 ```
 
 ### Programmatic Usage

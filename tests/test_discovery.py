@@ -68,6 +68,30 @@ class TestDiscoverEnvFiles:
             assert ".env.local" in file_names
             assert ".env.development" in file_names
 
+    def test_discovers_nested_env_files(self):
+        """Should discover nested .env files when recursive."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = Path(tmpdir) / "packages" / "app"
+            nested.mkdir(parents=True)
+            (nested / ".env").write_text("KEY=value\n")
+
+            files = discover_env_files(tmpdir)
+            rel_paths = {path.relative_to(tmpdir) for path in files}
+
+            assert Path("packages") / "app" / ".env" in rel_paths
+
+    def test_excludes_files(self):
+        """Should exclude specified files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / ".env").write_text("KEY1=value1\n")
+            (Path(tmpdir) / ".env.local").write_text("KEY2=value2\n")
+
+            files = discover_env_files(tmpdir, exclude_files={".env.local"})
+            file_names = [f.name for f in files]
+
+            assert ".env" in file_names
+            assert ".env.local" not in file_names
+
     def test_excludes_env_example(self):
         """Should exclude .env.example file."""
         with tempfile.TemporaryDirectory() as tmpdir:

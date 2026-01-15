@@ -3,7 +3,9 @@ Synchronization logic for .env -> .env.example with fuzzy matching and tombstone
 
 Key features:
 - Fuzzy rename detection (difflib.SequenceMatcher > 0.6)
-- Sticky values (never overwrite manual edits in .env.example)
+- Manual edits are overwritten by default (derived .env.example)
+- Existing .env.example keys are preserved unless explicitly deprecated
+- Duplicate keys collapse to a single entry
 - Tombstones (explicitly deprecated keys that block resurrection)
 - Multi-file aggregation with priority-based merging
 """
@@ -300,12 +302,12 @@ class Syncer:
             return self._aggregated_keys[key].source
         return ".env"
 
-    def sync(self, preserve_manual_edits: bool = True) -> str:
+    def sync(self, preserve_manual_edits: bool = False) -> str:
         """
         Sync .env to .env.example with fuzzy matching and tombstone support.
 
-        Keys are added/updated from env files. Keys removed from env files
-        are simply removed from .env.example (no auto-graveyard).
+        Keys are added/updated from env files. Keys missing from env files
+        remain in .env.example unless explicitly deprecated.
         Tombstoned keys are skipped and not added even if present in env files.
 
         Args:
@@ -319,10 +321,19 @@ class Syncer:
 
         # Step 1: Update existing keys and detect renames
         updated_keys = set()
+        seen_keys = set()
         new_tokens = []
 
         for token in self.example_tokens:
             if token.type == TokenType.KEY_VALUE and token.key:
+                # Drop active entries for tombstoned keys
+                if token.key in tombstoned_keys:
+                    continue
+
+                # De-dup keys to keep output idempotent
+                if token.key in seen_keys:
+                    continue
+                seen_keys.add(token.key)
                 # Check if key still exists in .env
                 if token.key in self.env_keys:
                     # Key exists - update placeholder if not manually edited
@@ -331,7 +342,7 @@ class Syncer:
                     # Check if value is a placeholder (starts with < and ends with >)
                     is_placeholder = token.value.startswith('<') and token.value.endswith('>')
                     if preserve_manual_edits and not is_placeholder:
-                        # Sticky value - keep manual edit
+                        # Preserve manual edits (opt-in only)
                         new_tokens.append(token)
                     else:
                         # Update to new placeholder
@@ -362,7 +373,9 @@ class Syncer:
                         )
                         new_tokens.append(renamed)
                         updated_keys.add(fuzzy_match)
-                    # else: Key removed - simply don't add it (no auto-graveyard)
+                    else:
+                        # Keep existing key when missing locally (union behavior)
+                        new_tokens.append(token)
             else:
                 # Non-key-value token - keep as-is (includes comments, blanks, tombstones)
                 new_tokens.append(token)

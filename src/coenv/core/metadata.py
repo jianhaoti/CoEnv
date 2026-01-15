@@ -32,7 +32,7 @@ class KeyMetadata:
 class ActivityLog:
     """Log entry for sync/save activities."""
     timestamp: str
-    action: str  # "sync", "save", "doctor"
+    action: str  # "sync", "save"
     user: str
     keys_affected: int
 
@@ -166,10 +166,10 @@ class MetadataStore:
 
     def log_activity(self, action: str, keys_affected: int, user: Optional[str] = None):
         """
-        Log a sync/save/doctor action.
+        Log a sync/save action.
 
         Args:
-            action: Type of action ("sync", "save", "doctor")
+            action: Type of action ("sync", "save")
             keys_affected: Number of keys affected
             user: User name (defaults to git user)
         """
@@ -220,7 +220,6 @@ class MetadataStore:
         # Count activities since week_start
         syncs = 0
         saves = 0
-        doctors = 0
         total_keys = 0
         users = set()
 
@@ -234,14 +233,10 @@ class MetadataStore:
                     syncs += 1
                 elif entry.action == "save":
                     saves += 1
-                elif entry.action == "doctor":
-                    doctors += 1
-
         return {
             'week_start': week_start.strftime('%Y-%m-%d'),
             'syncs': syncs,
             'saves': saves,
-            'doctors': doctors,
             'total_keys_affected': total_keys,
             'active_users': list(users),
             'user_count': len(users)
